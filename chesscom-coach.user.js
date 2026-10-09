@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Chess.com Coach
 // @namespace    hfy.chess.review
-// @version      8.2
+// @version      8.3
 // @description  Coach panel for chess.com analysis boards: evaluation, win bar, and a spoken-style explanation of why each of your moves was good or bad (optional read-aloud). The wording is written word by word by a small built-in neural network. Also supports four-player chess (Teams) analysis boards with the built-in Titan engine.
 // @match        https://www.chess.com/*
 // @grant        GM_xmlhttpRequest
@@ -15,8 +15,6 @@
 // @connect      chess-api.com
 // @connect      cdnjs.cloudflare.com
 // @connect      raw.githubusercontent.com
-// @downloadURL  https://raw.githubusercontent.com/TonyD365/Chess-Coach/refs/heads/main/chesscom-coach.user.js
-// @updateURL    https://raw.githubusercontent.com/TonyD365/Chess-Coach/refs/heads/main/chesscom-coach.user.js
 // @run-at       document-idle
 // ==/UserScript==
 
@@ -903,7 +901,7 @@
     else if (t.t === 'removeDefender') ring(t.target.sq, 'attacked');
   }
 
-  function compose(c, W, S) {
+  async function compose(c, W, S) {
     const P = W.PN, mv = W.move, bad = BAD.includes(c.kind);
     const talk = makeTalk(W, S), say = talk.say;
 
@@ -916,7 +914,7 @@
 
     // 这步的想法：只讲最重要的 1 条理由（由网络挑）
     const rs = playedReasons(c, W);
-    const chosen = rs.length ? S.select(rs, 1, 0, W) : [];
+    const chosen = rs.length ? await S.select(rs, 1, 0, W) : [];
     chosen.forEach((r, i) => {
       // 好棋才用“这样做 / 因为”接上；“还行”和坏棋前面是在挑毛病，断句另起一句
       const conn = WARN.includes(r.type) ? 'join.but' : i === 0 ? (bad || c.kind === 'good' ? 'join.badIdea' : 'join.idea') : 'join.more';
@@ -991,7 +989,7 @@
     // 更好的下法（这步本来可以怎么走——是对已走过这步的讲解，不是建议下一步）
     if (c.best && (bad || c.kind === 'good')) {
       const brs = bestReasons(c, W);
-      const why = brs.length ? S.select(brs, 1, 1, W) : [];
+      const why = brs.length ? await S.select(brs, 1, 1, W) : [];
       say('join.better');
       say('better', { m: mv(c.best) });
       at = S.toolLog.length;
@@ -1188,6 +1186,88 @@
       h = o;
     }
     return h[0];
+  }
+
+  // 在显卡上给一组候选打分（WebGPU）：每一层都是“矩阵 × 向量（+ tanh）”，一组候选一起算，每个候选的每一行一个线程；
+  // 只把最后的分数读回来。没有 WebGPU（或者候选太多）时用上面的 nnScore 在 CPU 上算。
+  const NN_WGSL = `
+    struct Dim { rows: u32, cols: u32, act: u32, pad: u32 };
+    @group(0) @binding(0) var<uniform> dim: Dim;
+    @group(0) @binding(1) var<storage, read> W: array<f32>;
+    @group(0) @binding(2) var<storage, read> bias: array<f32>;
+    @group(0) @binding(3) var<storage, read> x: array<f32>;
+    @group(0) @binding(4) var<storage, read_write> y: array<f32>;
+    @compute @workgroup_size(64, 1)
+    fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+      let r = id.x;
+      if (r >= dim.rows) { return; }
+      var s = bias[r];
+      let o = r * dim.cols;
+      let xo = id.y * dim.cols;
+      for (var j = 0u; j < dim.cols; j = j + 1u) { s = s + W[o + j] * x[xo + j]; }
+      if (dim.act == 1u) { s = tanh(s); }
+      y[id.y * dim.rows + r] = s;
+    }`;
+  const NN_GPU_BATCH = 32; // 一次最多打分的候选数
+  var NNGPU = null, nnGpuState = 'none'; // none | ready | failed
+  async function nnGpuInit() {
+    if (NNGPU || nnGpuState !== 'none') return NNGPU;
+    nnGpuState = 'failed';
+    try {
+      const gpu = typeof navigator !== 'undefined' && navigator.gpu;
+      if (!gpu || !NN_W) return null;
+      const adapter = await gpu.requestAdapter();
+      if (!adapter) return null;
+      const device = await adapter.requestDevice(), U = GPUBufferUsage, layers = net(), IN = layers[0].nIn;
+      const store = (arr) => { const b = device.createBuffer({ size: arr.byteLength, usage: U.STORAGE | U.COPY_DST }); device.queue.writeBuffer(b, 0, arr); return b; };
+      const blank = (n, extra) => device.createBuffer({ size: n * NN_GPU_BATCH * 4, usage: U.STORAGE | extra });
+      device.pushErrorScope('validation');
+      const pipeline = await device.createComputePipelineAsync({ layout: 'auto', compute: { module: device.createShaderModule({ code: NN_WGSL }), entryPoint: 'main' } });
+      const x = blank(IN, U.COPY_DST);
+      let src = x;
+      const passes = layers.map((l, k) => {
+        const dst = blank(l.nOut, k === layers.length - 1 ? U.COPY_SRC : 0), u = device.createBuffer({ size: 16, usage: U.UNIFORM | U.COPY_DST });
+        device.queue.writeBuffer(u, 0, new Uint32Array([l.nOut, l.nIn, k < layers.length - 1 ? 1 : 0, 0]));
+        const bind = device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries: [u, store(l.W), store(l.b), src, dst].map((buffer, binding) => ({ binding, resource: { buffer } })) });
+        src = dst;
+        return { n: Math.ceil(l.nOut / 64), bind };
+      });
+      const out = src, read = device.createBuffer({ size: NN_GPU_BATCH * 4, usage: U.MAP_READ | U.COPY_DST });
+      if (await device.popErrorScope()) return null;
+      const xv = new Float32Array(IN * NN_GPU_BATCH);
+      let dead = false;
+      const G = {
+        async scores(cx, feats) { // cx = 局面特征，feats = 每个候选的特征 → 每个候选的分数
+          try {
+            if (dead) throw new Error(LM_GPU_LOST);
+            const n = feats.length;
+            for (let i = 0; i < n; i++) { xv.set(cx, i * IN); xv.set(feats[i], i * IN + CTX_DIM); }
+            device.queue.writeBuffer(x, 0, xv, 0, n * IN);
+            const enc = device.createCommandEncoder();
+            for (const l of passes) {
+              const p = enc.beginComputePass();
+              p.setPipeline(pipeline);
+              p.setBindGroup(0, l.bind);
+              p.dispatchWorkgroups(l.n, n);
+              p.end();
+            }
+            enc.copyBufferToBuffer(out, 0, read, 0, NN_GPU_BATCH * 4);
+            device.queue.submit([enc.finish()]);
+            await read.mapAsync(GPUMapMode.READ);
+            const sc = Array.from(new Float32Array(read.getMappedRange()).subarray(0, n));
+            read.unmap();
+            return sc;
+          } catch (e) { // 显卡用不了了：之后在 CPU 上算；正在生成的这段讲解由调用方重来
+            if (NNGPU === G) NNGPU = null;
+            throw new Error(LM_GPU_LOST);
+          }
+        },
+      };
+      device.lost.then(() => { dead = true; if (NNGPU === G) NNGPU = null; });
+      NNGPU = G;
+      nnGpuState = 'ready';
+    } catch (e) { NNGPU = null; }
+    return NNGPU;
   }
 
   function mulberry32(a) {
@@ -1420,12 +1500,18 @@
     if (!LMCPU) LMCPU = lmCpu(lmModel(LM_CPU_FULL));
     return LMCPU;
   }
-  const lmInfo = () => { const e = lmEngine(); return { gpu: e === LMGPU, params: e.M.params, full: e.M.full }; };
+  const lmInfo = () => { const e = lmEngine(); return { gpu: e === LMGPU, params: e.M.params, full: e.M.full, nnGpu: !!NNGPU, nnParams: NN_LAYERS.slice(1).reduce((n, o, k) => n + o * NN_LAYERS[k] + o, 0) }; };
 
   // 自检：同一个输入，显卡算的和 CPU 算的（都是完整的网络）差多少、显卡每个词要多久
   async function lmProbe() {
     const N = lmNet(), G = await lmGpuInit();
-    if (!G) return { gpu: false, slim: lmModel(false).params };
+    let nn = null; // 选理由的网络：同一组输入，显卡和 CPU 打的分差多少
+    if (await nnGpuInit()) {
+      const cx = Float32Array.from({ length: CTX_DIM }, (_, i) => (i % 3 === 0 ? 1 : 0.25)), feats = [0, 1, 2, 3].map((k) => Float32Array.from({ length: CAND_DIM }, (_, i) => ((i + k) % 5 === 0 ? 1 : 0)));
+      const a = feats.map((f) => nnScore(nnPre(cx), f)), t1 = performance.now(), b = await NNGPU.scores(cx, feats);
+      nn = { diff: Math.max(...a.map((v, i) => Math.abs(v - b[i]))), mag: Math.max(...a.map(Math.abs)), ms: performance.now() - t1 };
+    }
+    if (!G) return { gpu: false, nn, slim: lmModel(false).params };
     const C = lmCpu(G.M), cs = [0, 1, 2], ctx = new Array(N.K).fill(N.id.get('<bos>'));
     C.begin(cs); G.begin(cs);
     const a = C.step(ctx), t0 = performance.now();
@@ -1433,7 +1519,7 @@
     for (let i = 0; i < 20; i++) b = await G.step(ctx);
     let diff = 0, mag = 0;
     for (let i = 0; i < a.length; i++) { diff = Math.max(diff, Math.abs(a[i] - b[i])); mag = Math.max(mag, Math.abs(a[i])); }
-    return { gpu: true, diff, mag, ms: (performance.now() - t0) / 20, full: G.M.params, slim: lmModel(false).params };
+    return { gpu: true, diff, mag, ms: (performance.now() - t0) / 20, nn, full: G.M.params, slim: lmModel(false).params };
   }
 
   // 同一句里有一段话说了两遍（连着 3 个词重复出现）就不要
@@ -1533,10 +1619,11 @@
   // recent / recentTexts：最近几步用过的候选和句子，网络会避开重复
   // known：这次打开页面后已经解释过的术语（不再重复解释）
   function makeSelector(c, seedStr, recent, recentTexts, known) {
-    const pre = nnPre(ctxVec(c)), rng = mulberry32(hash(seedStr)), used = [], texts = [], toolLog = [];
+    const cx = ctxVec(c), rng = mulberry32(hash(seedStr)), used = [], texts = [], toolLog = [];
+    let pre = null; // 在 CPU 上打分时才用得到
     const cnt = (id) => recent.reduce((n, r) => n + (r === id ? 1 : 0), 0);
-    function choose(feats, ids) {
-      const sc = feats.map((f) => nnScore(pre, f));
+    async function choose(feats, ids) { // 有 WebGPU 就在显卡上打分（要等结果，所以是异步的）
+      const sc = NNGPU && feats.length <= NN_GPU_BATCH ? await NNGPU.scores(cx, feats) : feats.map((f) => nnScore(pre || (pre = nnPre(cx)), f));
       const pr = softmax(sc, NN_T);
       let r = rng(), k = 0;
       while (k < pr.length - 1 && (r -= pr[k]) > 0) k++;
@@ -1544,10 +1631,15 @@
       return k;
     }
     const render1 = (x, p) => (typeof x === 'function' ? x(p || {}) : x);
-    const words = (t) => t.replace(/\{([^{}]+)\}/g, (m, alts) => {
-      const o = alts.split('|');
-      return o[choose(o.map((w) => candFeat('word', null, w, cnt('w:' + w), 0, 0)), o.map((w) => 'w:' + w))];
-    });
+    const words = async (t) => { // {a|b|c}：让网络挑一个词
+      let out = '', last = 0;
+      for (const m of t.matchAll(/\{([^{}]+)\}/g)) {
+        const o = m[1].split('|');
+        out += t.slice(last, m.index) + o[await choose(o.map((w) => candFeat('word', null, w, cnt('w:' + w), 0, 0)), o.map((w) => 'w:' + w))];
+        last = m.index + m[0].length;
+      }
+      return out + t.slice(last);
+    };
     return {
       used, texts,
       known: new Set(known || []), learned: [],                    // 已经解释过的术语 / 这段讲解里新解释的
@@ -1568,17 +1660,17 @@
         const ids = raw.map((_, i) => key + '#' + i);
         const cat = catOf(key), ctxTexts = recentTexts.concat(texts);
         const k = raw.length < 2 ? 0
-          : choose(raw.map((t, i) => candFeat(cat, null, stripSlots(t), cnt(ids[i]), simTo(ctxTexts, stripSlots(t)), 0)), ids);
-        const t = words(raw[k]);
+          : await choose(raw.map((t, i) => candFeat(cat, null, stripSlots(t), cnt(ids[i]), simTo(ctxTexts, stripSlots(t)), 0)), ids);
+        const t = await words(raw[k]);
         texts.push(t);
         return t;
       },
-      include(slot) {
+      async include(slot) {
         const ids = ['inc:' + slot + ':0', 'inc:' + slot + ':1'];
-        return choose([0, 1].map((v) => candFeat('include', slot, '', v ? cnt(ids[1]) : 0, 0, v)), ids) === 1;
+        return (await choose([0, 1].map((v) => candFeat('include', slot, '', v ? cnt(ids[1]) : 0, 0, v)), ids)) === 1;
       },
       // 从候选理由里一条条挑，第一条之后多一个“到此为止”选项；subj：0 = 这步棋，1 = 推荐着法
-      select(rs, max, subj, W) {
+      async select(rs, max, subj, W) {
         const left = rs.slice(), chosen = [], ctxTexts = recentTexts.concat(texts);
         const textOf = (r) => stripSlots(r.text || render1(W[r.key][0], r.p));
         while (left.length && chosen.length < max) {
@@ -1590,7 +1682,7 @@
             feats.push(candFeat('reason', null, '', 0, 0, 0, { type: 'stop', mag: 0, mate: 0, subj, order }));
             ids.push('r:stop');
           }
-          const k = choose(feats, ids);
+          const k = await choose(feats, ids);
           if (k >= left.length) break;
           chosen.push(left.splice(k, 1)[0]);
         }
@@ -1648,7 +1740,7 @@
         other: 'Focus: compare two or three candidate moves before you play one.',
       },
       statusT: 'Status', engine: 'Engine', localEngine: 'Local engine', sf: { idle: 'not loaded', loading: 'loading…', ready: 'ready', failed: 'failed to load' },
-      voice: 'Voice', version: 'Version', model: 'Model version', lm: 'Language model', lmGpu: (n) => `${n}M parameters, on the GPU (WebGPU)`, lmCpu: (n) => `${n}M parameters, on the CPU (no WebGPU)`,
+      voice: 'Voice', version: 'Version', model: 'Model version', lm: 'Language model', nn: 'Selector network', lmGpu: (n) => `${n}M parameters, on the GPU (WebGPU)`, lmCpu: (n) => `${n}M parameters, on the CPU (no WebGPU)`,
       mistakesT: (n) => `${n} wrong move${n === 1 ? '' : 's'} in the last 30 days`, today: 'Today', yesterday: 'Yesterday',
       openPos: 'Open this position', remove: 'Remove', copy: 'Copy all', copied: 'Copied ✓', copyTip: 'Copy the whole mistake book as text, to paste into a chat and go through it',
       settingsT: 'Settings', gRead: 'Reading', gMarks: 'Board marks', gBook: 'Mistake book',
@@ -2157,6 +2249,7 @@
           if (!LM || !NN_W) return;
           net(); lmNet();
           await lmGpuInit();
+          await nnGpuInit();
           self.postMessage({ info: lmInfo() });
           return;
         }
@@ -2789,7 +2882,7 @@
     if (whys.length) pg.append(h('div', { class: 'tipbox' }, T.focus[whys[0][0]]));
     const v = pickVoice(), ver = typeof GM_info !== 'undefined' && GM_info.script ? GM_info.script.version : '–';
     pg.append(h('h4', null, T.statusT), h('div', { class: 'kv' },
-      ...[[T.engine, cur && cur.src ? L()[cur.src] : '–'], [T.localEngine, T.sf[sfState]], [T.lm, lmNow ? (lmNow.gpu ? T.lmGpu : T.lmCpu)((lmNow.params / 1e6).toFixed(1)) : '–'], [T.model, modelVer ? `lm ${modelVer.lm} · nn ${modelVer.nn}` : modelState], [T.voice, v ? v.name : L().noVoice], [T.version, ver]]
+      ...[[T.engine, cur && cur.src ? L()[cur.src] : '–'], [T.localEngine, T.sf[sfState]], [T.lm, lmNow ? (lmNow.gpu ? T.lmGpu : T.lmCpu)((lmNow.params / 1e6).toFixed(1)) : '–'], [T.nn, lmNow ? (lmNow.nnGpu ? T.lmGpu : T.lmCpu)((lmNow.nnParams / 1e6).toFixed(1)) : '–'], [T.model, modelVer ? `lm ${modelVer.lm} · nn ${modelVer.nn}` : modelState], [T.voice, v ? v.name : L().noVoice], [T.version, ver]]
         .flatMap(([k, val]) => [h('span', null, k), h('b', null, val)])));
   }
 
@@ -3369,7 +3462,7 @@
   }
 
   // ---------- 四人讲解：一段连贯的口语，和普通象棋共用选词网络 ----------
-  function compose4(c, W, S) {
+  async function compose4(c, W, S) {
     const P = W.PN4, CN = W.CN4, bad = BAD.includes(c.kind), mine = (col, t) => (col === c.me ? W.yours4(P[t]) : W.mate4(CN[col], P[t]));
     const talk = makeTalk(W, S), say = talk.say;
     say('heads.' + c.kind, {});
@@ -3383,7 +3476,7 @@
     else if (p.checks.length && c.kind !== 'mate') rs.push({ type: 'check', key: 'check4', p: { who: CN[p.checks[0]] }, mag: 0.4 });
     if (c.threat) rs.push({ type: 'threat', key: 'threat4', p: { piece: P[p.piece], who: CN[c.threat.c], x: P[c.threat.t] }, mag: VAL4[c.threat.t] / 9 });
     if (c.sacrifice) rs.push({ type: 'sacrifice', key: 'sacrifice', p: { x: P[c.reply.cap.t] }, mag: 0.5 });
-    const chosen = rs.length && c.kind !== 'mate' ? S.select(rs, 1, 0, W) : [];
+    const chosen = rs.length && c.kind !== 'mate' ? await S.select(rs, 1, 0, W) : [];
     chosen.forEach((r, i) => { say(i === 0 ? (bad || c.kind === 'good' ? 'join.badIdea' : 'join.idea') : 'join.more'); say(r.key, r.p); });
     if (!chosen.length && !bad && c.kind !== 'good' && c.kind !== 'mate') { say('join.idea'); say('quiet', { piece: P[p.piece] }); }
 
