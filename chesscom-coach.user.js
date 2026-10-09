@@ -3,8 +3,7 @@
 // @namespace    hfy.chess.review
 // @version      8.2
 // @description  Coach panel for chess.com analysis boards: evaluation, win bar, and a spoken-style explanation of why each of your moves was good or bad (optional read-aloud). The wording is written word by word by a small built-in neural network. Also supports four-player chess (Teams) analysis boards with the built-in Titan engine.
-// @match        https://www.chess.com/analysis*
-// @match        https://www.chess.com/variants/4-player-chess/analysis*
+// @match        https://www.chess.com/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
 // @grant        GM_setValue
@@ -25,7 +24,7 @@
   // 只在分析棋盘上运行：和开头的 @match 保持一致。
   // chess.com 很多是“页面内跳转”（地址变了但页面不重新加载），Tampermonkey 不会再检查 @match，
   // 所以地址一离开这里列的页面（比如点了“新对局”），面板就隐藏、朗读停下。
-  const PAGES = [/^\/analysis/, /^\/variants\/4-player-chess\/analysis/];
+  const PAGES = [/.*/];
   const onPage = () => PAGES.some((re) => re.test(location.pathname));
 
   const LICHESS_URL = 'https://lichess.org/api/cloud-eval?fen=';
