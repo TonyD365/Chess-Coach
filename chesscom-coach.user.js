@@ -15,6 +15,8 @@
 // @connect      chess-api.com
 // @connect      cdnjs.cloudflare.com
 // @connect      raw.githubusercontent.com
+// @downloadURL  https://raw.githubusercontent.com/TonyD365/Chess-Coach/refs/heads/main/chesscom-coach.user.js
+// @updateURL    https://raw.githubusercontent.com/TonyD365/Chess-Coach/refs/heads/main/chesscom-coach.user.js
 // @run-at       document-idle
 // ==/UserScript==
 
